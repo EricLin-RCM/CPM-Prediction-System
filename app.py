@@ -8,7 +8,32 @@ import io
 # --- 網頁設定 ---
 st.set_page_config(page_title="CRM 產品預測系統", page_icon="📈", layout="wide")
 
-# --- 核心邏輯函數 (v4) ---
+# --- 1. 生成範例 Excel 的函數 (新功能) ---
+def generate_example_file():
+    output = io.BytesIO()
+    # 建立範例資料
+    data = {
+        '單據日期': ['2023.01.15', '2023.02.20', '2023.04.10', '2023.06.05', '2024.01.12'],
+        '數量': [100, 150, 200, 120, 300]
+    }
+    df_example = pd.DataFrame(data)
+    
+    # 使用 xlsxwriter 寫入
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # 建立兩個範例分頁，讓使用者知道可以放多個產品
+        df_example.to_excel(writer, index=False, sheet_name='產品A001')
+        df_example.to_excel(writer, index=False, sheet_name='產品B002')
+        
+        # 加入說明分頁 (可選)
+        workbook = writer.book
+        worksheet = writer.sheets['產品A001']
+        # 設定欄寬
+        worksheet.set_column('A:B', 15)
+        
+    output.seek(0)
+    return output.getvalue()
+
+# --- 2. 核心邏輯函數 (v4) ---
 def run_product_automation_v4_web(uploaded_file):
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -116,60 +141,87 @@ def run_product_automation_v4_web(uploaded_file):
     
     if final_summary:
         result_df = pd.DataFrame(final_summary)
-        # 確保只選取存在的欄位
         target_cols = ['產品編號', '分析信心度', '最後有效下單日', '【預測1】預計日期', '【預測1】預計數量', '【預測1】追蹤期限', '【預測2】預計日期', '預測間隔參考', '數據樣本數']
         final_cols = [c for c in target_cols if c in result_df.columns]
         return result_df[final_cols]
     else:
         return None
 
-# --- Excel 下載輔助函數 (修正版) ---
+# --- 3. Excel 下載輔助函數 ---
 def convert_df_to_excel(df):
     output = io.BytesIO()
-    # 使用 xlsxwriter 引擎
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='預測結果')
-        
-        # 嘗試自動調整欄寬 (如果不支援可移除這段 try-except)
         try:
             worksheet = writer.sheets['預測結果']
             for i, col in enumerate(df.columns):
-                # 簡單計算最大寬度
                 col_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
                 worksheet.set_column(i, i, col_len)
         except:
-            pass # 如果調整欄寬失敗，不影響檔案生成
-            
-    # 重置指標
+            pass
     output.seek(0)
     return output.getvalue()
 
-# --- 網頁主介面 ---
+# --- 4. 網頁主介面 ---
 def main():
     st.title("📊 CRM 顧客關係管理 - 產品下單預測系統")
-    st.markdown("### 自動化 AI 預測引擎")
-    st.info("請上傳 Excel 檔案，系統將自動分析並產出未來兩次的建議下單日。")
+    
+    # 說明區塊
+    with st.expander("📖 系統使用說明 (點擊展開)"):
+        st.markdown("""
+        **如何使用本系統：**
+        1. 下載下方的 **範例格式**。
+        2. 將您的產品銷售資料填入，**每一個產品請建立一個獨立的分頁 (Sheet)**。
+        3. 分頁名稱請命名為該產品的編號 (例如: P001)。
+        4. 欄位必須包含：`單據日期` (格式: 2024.01.01) 與 `數量`。
+        5. 上傳檔案並等待 AI 分析。
+        """)
 
-    uploaded_file = st.file_uploader("📂 上傳 Excel 檔案 (.xlsx)", type=['xlsx'])
+    st.markdown("---")
 
+    # --- 新增：下載範例區塊 ---
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.subheader("1. 取得格式")
+        st.markdown("請先下載範例，依照格式填入資料：")
+        
+        # 產生範例檔案
+        example_file = generate_example_file()
+        
+        st.download_button(
+            label="📥 下載 Excel 範例表單",
+            data=example_file,
+            file_name="import_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="點擊下載包含標準欄位的 Excel 範本"
+        )
+
+    with col2:
+        st.subheader("2. 上傳分析")
+        uploaded_file = st.file_uploader("📂 上傳填寫好的 Excel 檔案", type=['xlsx'])
+
+    # 執行區塊
     if uploaded_file is not None:
-        if st.button("🚀 開始分析", type="primary"):
+        st.markdown("---")
+        st.write("已讀取檔案，準備開始分析...")
+        
+        if st.button("🚀 開始執行預測分析", type="primary"):
             result_df = run_product_automation_v4_web(uploaded_file)
             
             if result_df is not None:
-                st.success(f"成功分析 {len(result_df)} 筆產品資料！")
-                st.dataframe(result_df.head())
+                st.success(f"✅ 分析完成！共處理 {len(result_df)} 筆產品資料。")
+                st.dataframe(result_df.head(), use_container_width=True)
                 
                 excel_data = convert_df_to_excel(result_df)
                 
                 st.download_button(
-                    label="📥 下載預測報告",
+                    label="📥 下載完整預測報告",
                     data=excel_data,
                     file_name='prediction_summary_v4.xlsx',
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 )
             else:
-                st.warning("沒有產出結果，請檢查 Excel 內容格式。")
+                st.error("❌ 無法產出結果。請檢查 Excel 格式是否與範例一致（需包含 '單據日期' 與 '數量'）。")
 
 if __name__ == "__main__":
     main()
