@@ -9,9 +9,8 @@ import io
 st.set_page_config(page_title="CRM 智慧產品預測系統", page_icon="🧠", layout="wide")
 
 # ==========================================
-# 🧠 核心升級 1: 智慧欄位偵測設定
+# 🧠 核心升級: 智慧欄位對照表 (新增客戶欄位)
 # ==========================================
-# 定義程式看得懂的「同義詞」，無論使用者欄位叫什麼，只要在清單內都能抓到
 COLUMN_MAPPING = {
     'date': [
         '單據日期', '下單日', '日期', '銷貨日期', '交易日期', '訂單日期', 
@@ -24,51 +23,53 @@ COLUMN_MAPPING = {
     'product': [
         '產品編號', '品號', '品名', '料號', 'Product ID', 'Item Code', 
         'Part Number', '產品名稱', '商品代碼'
+    ],
+    'customer': [
+        '客戶', '客戶代號', '客戶簡稱', '客戶名稱', 'Customer', 'Client', 
+        'Cust ID', 'Cust Name', 'Buyer'
     ]
 }
 
 def find_column(df, target_type):
-    """
-    在 DataFrame 中尋找符合 target_type (date/qty/product) 的欄位名稱
-    回傳: 找到的欄位名稱 (str) 或 None
-    """
+    """智慧尋找欄位名稱"""
     candidates = COLUMN_MAPPING.get(target_type, [])
     # 1. 精確比對
     for col in df.columns:
-        if col.strip() in candidates:
+        if str(col).strip() in candidates:
             return col
-    # 2. 模糊比對 (只要欄位名稱包含關鍵字)
+    # 2. 模糊比對
     for col in df.columns:
         for candidate in candidates:
-            if candidate in col:
+            if candidate in str(col):
                 return col
     return None
 
 # ==========================================
-# 📦 功能函數區
+# 📦 功能 1: 生成標準範本 (包含四大變數)
 # ==========================================
-
 def generate_example_file():
-    """生成範例 Excel 供使用者下載"""
     output = io.BytesIO()
+    # 建立包含完整維度的範例
     data = {
+        '客戶代號': ['C001', 'C001', 'C002', 'C001', 'C002'],
+        '產品編號': ['P-1001', 'P-1001', 'P-1001', 'P-2002', 'P-2002'],
         '單據日期': ['2023.01.15', '2023.02.20', '2023.04.10', '2023.06.05', '2024.01.12'],
         '數量': [100, 150, 200, 120, 300]
     }
     df_example = pd.DataFrame(data)
     
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_example.to_excel(writer, index=False, sheet_name='範例產品A')
-        # 加入說明
+        df_example.to_excel(writer, index=False, sheet_name='銷售明細表')
+        
+        # 加入格式說明
         workbook = writer.book
-        worksheet = writer.sheets['範例產品A']
-        worksheet.set_column('A:B', 15)
+        worksheet = writer.sheets['銷售明細表']
+        worksheet.set_column('A:D', 15)
         
     output.seek(0)
     return output.getvalue()
 
 def convert_df_to_excel(df):
-    """將 DataFrame 轉為 Excel binary"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='預測結果')
@@ -83,219 +84,238 @@ def convert_df_to_excel(df):
     return output.getvalue()
 
 # ==========================================
-# 🤖 核心邏輯函數 (升級版 v5)
+# 🔍 功能 2: 資料預檢與結構化 (Audit Phase)
 # ==========================================
-def run_product_automation_v5_web(uploaded_file):
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    status_text.text("正在讀取並解析 Excel 結構...")
-    
+def audit_and_process_data(uploaded_file):
+    """
+    讀取檔案，偵測欄位，並將資料轉換為統一的 {key: dataframe} 格式
+    回傳: (狀態訊息, 處理後的資料字典, 偵測到的欄位資訊)
+    """
     try:
-        # 讀取所有分頁
         raw_sheets = pd.read_excel(uploaded_file, sheet_name=None)
     except Exception as e:
-        st.error(f"檔案讀取失敗: {e}")
-        return None
+        return f"❌ 檔案讀取錯誤: {e}", None, None
 
-    # --- 🧠 核心升級 2: 自動資料結構標準化 ---
-    # 目標：無論使用者上傳的是「多 Sheet 模式」還是「單 Sheet 明細模式」
-    # 最終都轉換成 { '產品ID': DataFrame } 的統一格式
-    
     processed_dict = {}
-    
+    audit_info = {
+        "total_rows": 0,
+        "detected_columns": {},
+        "grouping_mode": "未知",
+        "groups_found": 0
+    }
+
     for sheet_name, df in raw_sheets.items():
         if df.empty: continue
         
-        # 1. 偵測關鍵欄位
+        # 1. 偵測欄位
         col_date = find_column(df, 'date')
         col_qty = find_column(df, 'qty')
-        col_prod = find_column(df, 'product') # 偵測是否有產品編號欄位
+        col_prod = find_column(df, 'product')
+        col_cust = find_column(df, 'customer')
         
         if not col_date or not col_qty:
-            # 如果連日期或數量都找不到，就跳過這個 Sheet
             continue
             
-        # 2. 判斷資料模式
-        if col_prod:
-            # [模式 A] 明細表模式：一張表包含多個產品 (如達宇)
-            # 自動依照「產品欄位」進行拆分
-            grouped = df.groupby(col_prod)
+        audit_info["detected_columns"] = {
+            "日期": col_date, "數量": col_qty, 
+            "產品": col_prod if col_prod else "(未偵測到 - 使用分頁名)",
+            "客戶": col_cust if col_cust else "(未偵測到 - 視為單一客戶)"
+        }
+        
+        # 標準化欄位名
+        rename_map = {col_date: 'date', col_qty: '數量'}
+        if col_prod: rename_map[col_prod] = 'product_id'
+        if col_cust: rename_map[col_cust] = 'customer_id'
+        
+        df = df.rename(columns=rename_map)
+        
+        # 2. 資料分組邏輯 (Grouping Logic)
+        if col_prod and col_cust:
+            # 模式 A: 客戶 + 產品 (最精準)
+            audit_info["grouping_mode"] = "精準模式 (客戶 + 產品)"
+            grouped = df.groupby(['customer_id', 'product_id'])
+            for (cid, pid), sub_df in grouped:
+                key = (str(cid).strip(), str(pid).strip()) # Key 為 Tuple
+                processed_dict[key] = sub_df
+                
+        elif col_prod:
+            # 模式 B: 僅產品 (忽略客戶差異)
+            audit_info["grouping_mode"] = "產品模式 (混合所有客戶)"
+            grouped = df.groupby('product_id')
             for pid, sub_df in grouped:
-                # 建立唯一的 key (避免不同 Sheet 有相同產品名覆蓋)
-                unique_key = f"{str(pid).strip()}" 
-                # 標準化欄位名稱供後續使用
-                sub_df = sub_df.rename(columns={col_date: 'date', col_qty: '數量'})
-                processed_dict[unique_key] = sub_df
+                key = ("全部客戶", str(pid).strip())
+                processed_dict[key] = sub_df
+                
         else:
-            # [模式 B] 獨立分頁模式：一個 Sheet 就是一個產品 (如竟丞/舊版)
-            # 使用 Sheet Name 作為產品 ID
-            df = df.rename(columns={col_date: 'date', col_qty: '數量'})
-            processed_dict[sheet_name] = df
+            # 模式 C: 僅分頁 (舊模式)
+            audit_info["grouping_mode"] = "簡易模式 (以分頁為產品)"
+            key = ("預設", sheet_name)
+            processed_dict[key] = df
 
-    if not processed_dict:
-        st.error("❌ 無法識別任何有效資料。請確認 Excel 中包含代表「日期」與「數量」的欄位。")
-        return None
+        audit_info["total_rows"] += len(df)
 
-    # --- 開始跑預測迴圈 (邏輯同 v4) ---
-    final_summary = []
-    total_items = len(processed_dict)
-    processed_count = 0
+    audit_info["groups_found"] = len(processed_dict)
     
-    status_text.text(f"成功識別 {total_items} 個產品，開始 AI 分析...")
-
-    for product_id, df in processed_dict.items():
-        processed_count += 1
-        # 更新進度條 (每 5% 更新一次避免太頻繁)
-        if processed_count % max(1, int(total_items/20)) == 0:
-            progress = int((processed_count / total_items) * 100)
-            progress_bar.progress(progress)
-            status_text.text(f"正在分析: {product_id} ({processed_count}/{total_items})")
-
-        # --- 以下邏輯與 v4 完全相同 ---
+    if not processed_dict:
+        return "❌ 找不到有效的 [日期] 與 [數量] 欄位，請檢查 Excel。", None, None
         
-        # A. 資料清洗
+    return "OK", processed_dict, audit_info
+
+# ==========================================
+# 🤖 功能 3: AI 預測執行 (Prediction Phase)
+# ==========================================
+def run_prediction_engine(processed_data):
+    final_summary = []
+    
+    # 建立進度條
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(processed_data)
+    count = 0
+
+    for (cust_id, prod_id), df in processed_data.items():
+        count += 1
+        if count % max(1, int(total/20)) == 0:
+            progress_bar.progress(int((count / total) * 100))
+            status_text.text(f"分析中... {cust_id} - {prod_id}")
+
+        # --- 以下邏輯與 v5 核心相同 ---
+        # A. 清洗
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        # 確保數量是數字，並過濾掉退貨 (負數) 或 0
         df['數量'] = pd.to_numeric(df['數量'], errors='coerce')
-        df = df[df['數量'] > 0] 
-        df = df.dropna(subset=['date', '數量']).sort_values('date').reset_index(drop=True)
-        
+        df = df[df['數量'] > 0].dropna(subset=['date', '數量']).sort_values('date').reset_index(drop=True)
         if df.empty: continue
 
-        # B. 合併訂單 (7天內)
+        # B. 合併訂單 (7天)
         df['temp_gap'] = df['date'].diff().dt.days.fillna(999)
         df['session_id'] = (df['temp_gap'] > 7).cumsum()
-        
-        df = df.groupby('session_id').agg({
-            'date': 'last',
-            '數量': 'sum'
-        }).reset_index(drop=True)
+        df = df.groupby('session_id').agg({'date': 'last', '數量': 'sum'}).reset_index(drop=True)
+        if len(df) < 2: continue
 
-        if len(df) < 2: continue 
-
-        # C. 特徵工程
+        # C. 特徵
         df['year'] = df['date'].dt.year
         df['month'] = df['date'].dt.month
         df['days_since_last'] = df['date'].diff().dt.days.fillna(0)
-        
-        df['rolling_days'] = df['days_since_last'].rolling(window=3, min_periods=1).mean()
-        df['rolling_qty'] = df['數量'].rolling(window=3, min_periods=1).mean()
-        
+        df['rolling_days'] = df['days_since_last'].rolling(3, min_periods=1).mean()
+        df['rolling_qty'] = df['數量'].rolling(3, min_periods=1).mean()
         df['target_days'] = df['date'].shift(-1).diff().dt.days.shift(-1)
         df['target_qty'] = df['數量'].shift(-1)
 
-        train_data = df[df['year'] >= 2022].copy()
-        if len(train_data) < 5: train_data = df.tail(10).copy()
-        
-        train_df = train_data.dropna(subset=['target_days', 'target_qty']).copy()
+        train_df = df.dropna(subset=['target_days', 'target_qty']).copy()
+        if len(train_df) >= 3: # 降低門檻，有3筆就跑
+            train_df = train_df[train_df['year'] >= 2022] # 只取近期
+            if len(train_df) < 3: train_df = df.tail(10) # 若篩完太少，用全部
+
         features = ['數量', 'days_since_last', 'month', 'rolling_days', 'rolling_qty']
         last_row = df.tail(1).copy()
+        sample_count = len(train_df)
 
         # D. 混合預測
-        sample_count = len(train_df)
-        
         if sample_count < 5:
             p_days_1 = df['days_since_last'].median()
             p_qty_1 = df['數量'].median()
-            confidence_label = "低 (採統計中位數)"
+            conf_label = "低 (統計中位數)"
         else:
-            train_df.loc[:, 'weight'] = train_df['year'].apply(lambda x: 1.2 if x >= 2024 else 1.0)
-            model_days = RandomForestRegressor(n_estimators=100, random_state=42)
-            model_qty = RandomForestRegressor(n_estimators=100, random_state=42)
-            
-            model_days.fit(train_df[features], train_df['target_days'], sample_weight=train_df['weight'])
-            model_qty.fit(train_df[features], train_df['target_qty'], sample_weight=train_df['weight'])
-            
-            p_days_1 = model_days.predict(last_row[features])[0]
-            p_qty_1 = model_qty.predict(last_row[features])[0]
-            confidence_label = "高 (AI 模型分析)"
+            try:
+                model_d = RandomForestRegressor(n_estimators=100, random_state=42)
+                model_q = RandomForestRegressor(n_estimators=100, random_state=42)
+                model_d.fit(train_df[features], train_df['target_days'])
+                model_q.fit(train_df[features], train_df['target_qty'])
+                p_days_1 = model_d.predict(last_row[features])[0]
+                p_qty_1 = model_q.predict(last_row[features])[0]
+                conf_label = "高 (AI 模型)"
+            except:
+                p_days_1 = df['days_since_last'].median()
+                p_qty_1 = df['數量'].median()
+                conf_label = "低 (模型錯誤轉統計)"
 
-        # E. 安全約束
-        history_max_gap = max(df['days_since_last'].max(), 30)
-        p_days_1 = min(p_days_1, 540, history_max_gap * 1.2)
-        p_days_1 = max(1, int(round(p_days_1)))
-        p_qty_1 = max(1, int(round(p_qty_1)))
+        # E. 約束
+        max_gap = max(df['days_since_last'].max(), 30) * 1.5
+        p_days_1 = max(1, int(min(p_days_1, 540, max_gap)))
+        p_qty_1 = max(1, int(p_qty_1))
 
-        last_date = last_row['date'].iloc[0]
-        date_1 = last_date + timedelta(days=p_days_1)
-        deadline_1 = date_1 + timedelta(days=40)
-        
-        # F. T+2
-        date_2 = date_1 + timedelta(days=p_days_1)
+        date_1 = last_row['date'].iloc[0] + timedelta(days=p_days_1)
+        date_2 = date_1 + timedelta(days=p_days_1) # T+2 簡化推估
 
         final_summary.append({
-            '產品編號': product_id,
-            '分析信心度': confidence_label,
-            '最後有效下單日': last_date.strftime('%Y-%m-%d'),
-            '【預測1】預計日期': date_1.strftime('%Y-%m-%d'),
-            '【預測1】預計數量': p_qty_1,
-            '【預測1】追蹤期限': deadline_1.strftime('%Y-%m-%d'),
-            '【預測2】預計日期': date_2.strftime('%Y-%m-%d'),
-            '預測間隔參考': f"約 {p_days_1} 天下單一次",
-            '數據樣本數': sample_count
+            '客戶名稱': cust_id,
+            '產品編號': prod_id,
+            '分析信心度': conf_label,
+            '最後下單日': last_row['date'].iloc[0].strftime('%Y-%m-%d'),
+            '【預測1】日期': date_1.strftime('%Y-%m-%d'),
+            '【預測1】數量': p_qty_1,
+            '【預測2】日期': date_2.strftime('%Y-%m-%d'),
+            '歷史樣本數': sample_count
         })
 
-    status_text.text("分析完成！")
     progress_bar.empty()
+    status_text.empty()
     
     if final_summary:
-        result_df = pd.DataFrame(final_summary)
-        target_cols = ['產品編號', '分析信心度', '最後有效下單日', '【預測1】預計日期', '【預測1】預計數量', '【預測1】追蹤期限', '【預測2】預計日期', '預測間隔參考', '數據樣本數']
-        final_cols = [c for c in target_cols if c in result_df.columns]
-        return result_df[final_cols]
-    else:
-        return None
+        return pd.DataFrame(final_summary)
+    return None
 
 # ==========================================
 # 🖥️ 網頁主介面
 # ==========================================
 def main():
-    st.title("🧠 CRM 智慧產品預測系統 (v5)")
-    st.markdown("### 支援多種 Excel 格式的 AI 預測引擎")
-    
-    with st.expander("📖 支援的欄位格式說明 (系統會自動偵測，無需完全一致)"):
-        st.markdown("""
-        本系統具備**智慧欄位對照**功能，只要您的 Excel 包含以下概念的欄位即可：
-        
-        1. **日期欄位**：可命名為 `單據日期`, `下單日`, `日期`, `Date`, `Order Date`...
-        2. **數量欄位**：可命名為 `數量`, `訂單數量`, `銷貨數量`, `Qty`, `Quantity`...
-        3. **產品欄位 (選用)**：若您的 Excel 是「一張表包含所有產品明細」，請確保有 `品號`, `品名`, `產品編號` 欄位，系統會自動拆分分析。
-        """)
+    st.title("🧠 CRM 智慧產品預測系統 (v6)")
+    st.caption("支援：客戶分群預測 • 資料規格預檢 • 智慧欄位偵測")
 
-    st.markdown("---")
-
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.subheader("1. 取得範本")
-        example_file = generate_example_file()
-        st.download_button(
-            label="📥 下載標準範本 (可選)",
-            data=example_file,
-            file_name="import_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        st.info("💡 您也可以直接上傳既有的 ERP 匯出檔，系統會嘗試自動識別！")
-
-    with col2:
-        st.subheader("2. 上傳分析")
-        uploaded_file = st.file_uploader("📂 上傳 Excel 檔案 (.xlsx)", type=['xlsx'])
-
-    if uploaded_file is not None:
+    # --- 側邊欄：範本下載 ---
+    with st.sidebar:
+        st.header("1. 準備資料")
+        st.markdown("請下載範本，並填入您的銷售數據。")
+        ex_file = generate_example_file()
+        st.download_button("📥 下載標準範本 (.xlsx)", ex_file, "import_template.xlsx")
         st.markdown("---")
-        if st.button("🚀 啟動 AI 識別與預測", type="primary"):
-            result_df = run_product_automation_v5_web(uploaded_file)
+        st.info("**欄位說明**：\n- **客戶/產品**：系統會依此分組。\n- **日期/數量**：核心預測變數。")
+
+    # --- 主畫面：上傳與檢核 ---
+    st.header("2. 上傳與檢核")
+    uploaded_file = st.file_uploader("請上傳 Excel 檔案", type=['xlsx'])
+
+    if uploaded_file:
+        # 1. 執行資料預檢 (Data Audit)
+        status, processed_data, audit_info = audit_and_process_data(uploaded_file)
+
+        if status != "OK":
+            st.error(status)
+        else:
+            # 2. 顯示檢核報告 (Confirmation UI)
+            st.success("✅ 檔案讀取成功！請確認以下資料規格：")
             
-            if result_df is not None:
-                st.success(f"✅ 分析完成！共處理 {len(result_df)} 筆產品預測。")
-                st.dataframe(result_df.head(), use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("總資料筆數", audit_info["total_rows"])
+            c2.metric("分析組合數 (客戶x產品)", audit_info["groups_found"])
+            c3.info(f"偵測模式：{audit_info['grouping_mode']}")
+
+            with st.expander("🔍 查看詳細欄位偵測結果", expanded=True):
+                st.json(audit_info["detected_columns"])
+                st.markdown("如果偵測結果正確，請點擊下方按鈕開始分析。")
+
+            # 3. 執行分析按鈕
+            if st.button("🚀 確認無誤，開始預測分析", type="primary"):
+                result_df = run_prediction_engine(processed_data)
                 
-                excel_data = convert_df_to_excel(result_df)
-                st.download_button(
-                    label="📥 下載完整預測報告",
-                    data=excel_data,
-                    file_name='prediction_summary_v5.xlsx',
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                )
+                if result_df is not None:
+                    st.divider()
+                    st.header("3. 分析結果")
+                    st.success(f"完成！共產出 {len(result_df)} 筆預測結果。")
+                    
+                    # 呈現結果表格
+                    st.dataframe(result_df.head(), use_container_width=True)
+                    
+                    # 下載按鈕
+                    excel_data = convert_df_to_excel(result_df)
+                    st.download_button(
+                        "📥 下載完整預測報告 (.xlsx)",
+                        excel_data,
+                        "prediction_summary_v6.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.warning("⚠️ 分析完成，但因資料量不足 (每組需至少 2 筆交易)，沒有產出預測結果。")
 
 if __name__ == "__main__":
     main()
