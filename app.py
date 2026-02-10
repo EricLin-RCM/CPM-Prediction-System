@@ -4,6 +4,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from datetime import timedelta
 import io
+import re
 
 # --- 網頁設定 ---
 st.set_page_config(page_title="CRM 智慧產品預測系統", page_icon="🧠", layout="wide")
@@ -12,124 +13,144 @@ st.set_page_config(page_title="CRM 智慧產品預測系統", page_icon="🧠", 
 # 🧠 核心升級: 智慧欄位對照表
 # ==========================================
 COLUMN_MAPPING = {
-    'date': [
-        '單據日期', '下單日', '日期', '銷貨日期', '交易日期', '訂單日期', 
-        'Date', 'Order Date', 'Txn Date'
-    ],
-    'qty': [
-        '數量', '訂單數量', '銷貨數量', '實際出貨數量', 'Qty', 'Quantity', 
-        'Amount', '銷售數量', '出貨數量'
-    ],
-    'product': [
-        '產品編號', '品號', '品名', '料號', 'Product ID', 'Item Code', 
-        'Part Number', '產品名稱', '商品代碼'
-    ],
-    'customer': [
-        '客戶', '客戶代號', '客戶簡稱', '客戶名稱', 'Customer', 'Client'
-    ]
+    'date': ['單據日期', '下單日', '日期', '銷貨日期', '交易日期', '訂單日期', 'Date', 'Order Date'],
+    'qty': ['數量', '訂單數量', '銷貨數量', 'Qty', 'Quantity', 'Amount'],
+    'product': ['產品編號', '品號', '品名', '料號', 'Product ID'],
+    'customer': ['客戶', '客戶代號', '客戶簡稱', '客戶名稱', 'Customer']
 }
 
 def find_column(df, target_type):
-    """智慧尋找欄位名稱"""
     candidates = COLUMN_MAPPING.get(target_type, [])
-    # 1. 精確比對
     for col in df.columns:
-        if str(col).strip() in candidates:
-            return col
-    # 2. 模糊比對
+        if str(col).strip() in candidates: return col
     for col in df.columns:
         for candidate in candidates:
-            if candidate in str(col):
-                return col
+            if candidate in str(col): return col
     return None
 
 # ==========================================
-# 🧹 ERP 資料清洗核心 (新增功能)
+# 🧹 ERP 資料清洗核心 (v8 強力版)
 # ==========================================
+def try_read_content(uploaded_file):
+    """
+    暴力嘗試讀取檔案內容，解決 Big5/UTF-8 編碼問題
+    """
+    bytes_data = uploaded_file.getvalue()
+    
+    # 1. 嘗試常見編碼
+    encodings = ['utf-8', 'cp950', 'big5', 'gbk', 'utf-16']
+    
+    for enc in encodings:
+        try:
+            # 嘗試解碼並按行切割
+            content = bytes_data.decode(enc)
+            lines = content.splitlines()
+            return lines
+        except:
+            continue
+    return None
+
 def clean_messy_erp_file(uploaded_file):
     """
-    專門處理格式跑掉的 ERP 報表 (列印格式轉 Excel)
+    v8: 純文字解析模式，不依賴 Pandas 的 read_csv，
+    專門對付格式極度混亂的 ERP 報表。
     """
-    try:
-        # 嘗試讀取為 CSV (很多 ERP 匯出其實是 Tab 分隔或逗號分隔)
-        uploaded_file.seek(0)
-        df_raw = pd.read_csv(uploaded_file, header=None)
-    except:
-        try:
-            uploaded_file.seek(0)
-            df_raw = pd.read_excel(uploaded_file, header=None)
-        except:
-            return None
+    lines = try_read_content(uploaded_file)
+    
+    if not lines:
+        return None
 
     cleaned_rows = []
     current_date = None
     current_customer = None
     
-    # 硬編碼關鍵欄位位置 (基於 prn34c.xls 分析)
-    # 產品編號通常在第 5 欄 (Index 5)
-    
-    for i, row in df_raw.iterrows():
+    # 逐行解析
+    for line in lines:
+        # 去除引號中的逗號 (避免 CSV 分割錯誤)，簡單處理
+        # 這裡假設金額裡的逗號是干擾源，先簡單移除引號
+        line_clean = line.replace('"', '').replace("'", "")
+        parts = line_clean.split(',')
+        
+        # 移除前後空白
+        parts = [p.strip() for p in parts]
+        
+        # 如果切出來欄位太少，可能是空行
+        if len(parts) < 3: continue
+
         # 1. 偵測日期行
-        first_col = str(row[0]).strip()
-        if "訂單日期" in first_col:
-            val = str(row[2]).strip() # 日期通常在第 3 欄
-            if val and val != 'nan':
-                current_date = val.replace('.', '-') # 轉成標準格式
+        # 檢查第 0 欄是否包含 "訂單日期"
+        if "訂單日期" in parts[0]:
+            # 日期通常在第 2 或第 3 個位置
+            for p in parts[1:5]: 
+                # 簡單正則：抓 202x.xx.xx
+                if re.search(r'202\d', p):
+                    current_date = p.replace('.', '-').strip()
+                    break
             continue
 
         # 2. 偵測資料行
-        # 判斷依據: 第 5 欄有值，且不是標題
-        if len(row) > 5:
-            prod_id = str(row[5]).strip()
-            if prod_id and prod_id != 'nan' and prod_id != "產品編號":
+        # 條件：第 5 欄 (Index 5) 是產品編號，且不為空，且不是標題
+        if len(parts) > 6:
+            prod_id = parts[5]
+            
+            # 過濾條件
+            if prod_id and prod_id != "產品編號" and "合計" not in line and "總計" not in line:
                 
-                # 處理客戶 (填補空白)
-                cust = str(row[0]).strip()
-                if cust and cust != 'nan':
-                    current_customer = cust
+                # 抓客戶 (如果第 0 欄有字，就是新客戶；沒字就沿用舊的)
+                if parts[0]:
+                    current_customer = parts[0]
                 
-                # 處理數量與單價 (最困難的部分：欄位會位移)
-                # 策略：找到「產品名稱」後面的「單位」欄位，數值通常在單位後面
-                unit_idx = -1
-                prod_name_col = 9
-                
-                # 往後找「單位」(通常是文字且長度短)
-                if len(row) > prod_name_col:
-                    for c in range(prod_name_col + 1, len(row)):
-                        val = str(row[c]).strip()
-                        # 判斷是否為數字
-                        try:
-                            float(val.replace(',', ''))
-                            is_num = True
-                        except:
-                            is_num = False
-                        
-                        if val and val != 'nan' and not is_num:
-                            unit_idx = c
-                            break
+                # 抓數量 (最難的部分)
+                # 策略：從後面往前找，找到「單位」(MPS/KG/箱) 之後的數字
                 
                 qty = 0.0
                 
+                # 尋找單位的位置
+                unit_candidates = ["MPS", "KG", "PCS", "SET", "箱", "台", "支", "一般包裝"]
+                unit_idx = -1
+                
+                # 掃描這一行，找單位
+                for idx, val in enumerate(parts):
+                    if val in unit_candidates:
+                        unit_idx = idx
+                        break
+                
+                # 如果找不到常見單位，嘗試找「產品名稱」(Index 9) 後面的非數字欄位
+                if unit_idx == -1 and len(parts) > 10:
+                     for idx in range(10, len(parts)):
+                         # 找一個長度短的非數字字串當作單位
+                         if parts[idx] and not parts[idx].replace('.','').isdigit() and len(parts[idx]) < 5:
+                             unit_idx = idx
+                             break
+                
+                # 如果找到了單位，數量通常在單位後面 1~3 格內
                 if unit_idx != -1:
-                    # 收集單位後面的所有數字
-                    nums = []
-                    for c in range(unit_idx + 1, len(row)):
-                        val = str(row[c]).strip()
+                    potential_nums = []
+                    for k in range(unit_idx + 1, min(unit_idx + 5, len(parts))):
+                        val = parts[k].replace(',', '') # 去除千分位
                         try:
-                            num = float(val.replace(',', ''))
-                            nums.append(num)
+                            f_val = float(val)
+                            potential_nums.append(f_val)
                         except:
                             pass
-                        if len(nums) >= 3: break 
                     
-                    # 啟發式規則
-                    if len(nums) >= 2:
-                        qty = nums[1] # 通常是 [單價, 數量]
-                    elif len(nums) == 1:
-                        qty = nums[0]
+                    # 邏輯：如果有 2 個數字，通常是 [單價, 數量] -> 取第 2 個
+                    # 如果只有 1 個數字，就是數量 -> 取第 1 個
+                    if len(potential_nums) >= 2:
+                        qty = potential_nums[1]
+                    elif len(potential_nums) == 1:
+                        qty = potential_nums[0]
                 
-                # 排除合計行
-                if "合計" not in str(row.values) and "總計" not in str(row.values):
+                # 如果還是沒抓到，嘗試直接抓第 20~25 欄位的數字 (Blind guess)
+                if qty == 0 and len(parts) > 20:
+                     try:
+                         # 嘗試讀取 prn34c.xls 結構中的數量位置
+                         candidate = parts[21].replace(',', '') # 假設位置
+                         if candidate: qty = float(candidate)
+                     except:
+                         pass
+
+                if qty > 0:
                     cleaned_rows.append({
                         '單據日期': current_date,
                         '客戶名稱': current_customer,
@@ -143,7 +164,7 @@ def clean_messy_erp_file(uploaded_file):
     return pd.DataFrame(cleaned_rows)
 
 # ==========================================
-# 📦 輔助功能: 範本與 Excel 輸出
+# 📦 輔助功能
 # ==========================================
 def generate_example_file():
     output = io.BytesIO()
@@ -174,48 +195,39 @@ def convert_df_to_excel(df):
     return output.getvalue()
 
 # ==========================================
-# 🔍 資料預檢與結構化 (整合清洗邏輯)
+# 🔍 資料預檢與結構化
 # ==========================================
 def audit_and_process_data(uploaded_file):
-    # 1. 嘗試直接讀取 (標準 Excel)
-    try:
-        raw_sheets = pd.read_excel(uploaded_file, sheet_name=None)
-    except:
-        # 如果讀失敗，可能是 CSV 或亂碼檔
-        uploaded_file.seek(0)
-        try:
-            raw_sheets = {'Sheet1': pd.read_csv(uploaded_file)}
-        except:
-            raw_sheets = {} # 讀取失敗
-
+    # 嘗試讀取
     processed_dict = {}
     audit_info = {"total_rows": 0, "detected_columns": {}, "grouping_mode": "未知", "groups_found": 0}
     
-    # 🚩 判斷是否需要啟動「ERP 清洗模式」
-    # 如果讀進來第一欄有很多 NaN，或者找不到標題，很有可能是跑掉的格式
-    needs_cleaning = False
-    
-    # 簡單檢查：如果所有 Sheet 都找不到 'date' 和 'qty'，就假設需要清洗
-    valid_sheets = 0
-    for _, df in raw_sheets.items():
-        if find_column(df, 'date') and find_column(df, 'qty'):
-            valid_sheets += 1
-            
-    if valid_sheets == 0:
-        needs_cleaning = True
+    # 1. 先嘗試標準讀取
+    raw_sheets = {}
+    try:
+        raw_sheets = pd.read_excel(uploaded_file, sheet_name=None)
+    except:
+        pass # 失敗也沒關係，後面會處理
+
+    # 2. 判斷是否需要清洗
+    needs_cleaning = True
+    if raw_sheets:
+        for _, df in raw_sheets.items():
+            if find_column(df, 'date') and find_column(df, 'qty'):
+                needs_cleaning = False # 有標準欄位，不用洗
+                break
     
     if needs_cleaning:
         uploaded_file.seek(0)
-        st.toast("偵測到非標準格式，正在啟動 ERP 清洗引擎...", icon="🧹")
+        # st.toast("啟動強力清洗模式 (Big5/UTF-8)...", icon="🧹")
         df_cleaned = clean_messy_erp_file(uploaded_file)
         
         if df_cleaned is not None and not df_cleaned.empty:
-            # 清洗成功，將其視為標準資料繼續處理
             raw_sheets = {'Cleaned_Data': df_cleaned}
         else:
-            return "❌ 無法識別檔案格式，且自動清洗失敗。請檢查檔案是否為支援的 Excel/CSV。", None, None
+            return "❌ 檔案讀取失敗。請確認檔案不是損壞的，或嘗試將檔案另存為標準 CSV (UTF-8) 格式。", None, None
 
-    # --- 以下邏輯與標準化處理相同 ---
+    # --- 以下標準化流程 ---
     for sheet_name, df in raw_sheets.items():
         if df.empty: continue
         
@@ -226,17 +238,13 @@ def audit_and_process_data(uploaded_file):
         
         if not col_date or not col_qty: continue
             
-        audit_info["detected_columns"] = {
-            "日期": col_date, "數量": col_qty, 
-            "產品": col_prod, "客戶": col_cust
-        }
+        audit_info["detected_columns"] = {"日期": col_date, "數量": col_qty, "產品": col_prod, "客戶": col_cust}
         
         rename_map = {col_date: 'date', col_qty: '數量'}
         if col_prod: rename_map[col_prod] = 'product_id'
         if col_cust: rename_map[col_cust] = 'customer_id'
         df = df.rename(columns=rename_map)
         
-        # 分組邏輯
         if col_prod and col_cust:
             audit_info["grouping_mode"] = "精準模式 (客戶 + 產品)"
             for (cid, pid), sub_df in df.groupby(['customer_id', 'product_id']):
@@ -261,7 +269,7 @@ def audit_and_process_data(uploaded_file):
     return "OK", processed_dict, audit_info
 
 # ==========================================
-# 🤖 預測引擎 (核心邏輯)
+# 🤖 預測引擎
 # ==========================================
 def run_prediction_engine(processed_data):
     final_summary = []
@@ -278,13 +286,11 @@ def run_prediction_engine(processed_data):
         df = df[df['數量'] > 0].dropna(subset=['date', '數量']).sort_values('date').reset_index(drop=True)
         if df.empty: continue
 
-        # 合併訂單 (7天)
         df['temp_gap'] = df['date'].diff().dt.days.fillna(999)
         df['session_id'] = (df['temp_gap'] > 7).cumsum()
         df = df.groupby('session_id').agg({'date': 'last', '數量': 'sum'}).reset_index(drop=True)
         if len(df) < 2: continue
 
-        # 特徵工程
         df['year'] = df['date'].dt.year
         df['month'] = df['date'].dt.month
         df['days_since_last'] = df['date'].diff().dt.days.fillna(0)
@@ -298,7 +304,6 @@ def run_prediction_engine(processed_data):
 
         last_row = df.tail(1).copy()
         
-        # 混合預測 (AI + 統計)
         if len(train_df) < 5:
             p_days = df['days_since_last'].median()
             p_qty = df['數量'].median()
@@ -308,7 +313,7 @@ def run_prediction_engine(processed_data):
                 model_d = RandomForestRegressor(n_estimators=100, random_state=42)
                 model_d.fit(train_df[['數量', 'days_since_last', 'month']], train_df['target_days'])
                 p_days = model_d.predict(last_row[['數量', 'days_since_last', 'month']])[0]
-                p_qty = df['數量'].median() # 簡化數量預測以求穩
+                p_qty = df['數量'].median()
                 conf = "高 (AI)"
             except:
                 p_days = df['days_since_last'].median()
@@ -334,34 +339,27 @@ def run_prediction_engine(processed_data):
 # 🖥️ 網頁主介面
 # ==========================================
 def main():
-    st.title("🧠 CRM 智慧產品預測系統 (v7)")
-    st.caption("支援功能：自動清洗 ERP 報表 • 客戶分群預測 • 智慧欄位偵測")
+    st.title("🧠 CRM 智慧產品預測系統 (v8)")
+    st.caption("支援功能：強力清洗 ERP 亂碼報表 • 客戶分群預測 • 智慧欄位偵測")
 
     with st.sidebar:
         st.header("1. 準備資料")
         ex_file = generate_example_file()
         st.download_button("📥 下載標準範本", ex_file, "template.xlsx")
-        st.info("💡 提示：您也可以直接上傳從 ERP 匯出的原始報表 (如 prn34c.xls)，系統會自動嘗試整理格式。")
 
     st.header("2. 上傳與檢核")
-    uploaded_file = st.file_uploader("上傳 Excel/CSV 檔案", type=['xlsx', 'csv', 'xls'])
+    uploaded_file = st.file_uploader("上傳 Excel/CSV (支援 prn/txt 匯出檔)", type=['xlsx', 'csv', 'xls', 'txt'])
 
     if uploaded_file:
         status, processed_data, audit_info = audit_and_process_data(uploaded_file)
 
         if status != "OK":
             st.error(status)
+            st.warning("💡 提示：如果依然無法讀取，請將該檔案在 Excel 中開啟，並『另存新檔』為 CSV (UTF-8) 格式後再上傳。")
         else:
             st.success("✅ 檔案讀取成功！")
             
-            # --- 資料預覽與確認區 ---
-            st.subheader("🧐 資料預覽")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("總資料筆數", audit_info["total_rows"])
-            c2.metric("分析組合數", audit_info["groups_found"])
-            c3.info(f"模式：{audit_info['grouping_mode']}")
-            
-            st.markdown("請檢查下方的**【數量】**與**【產品】**是否正確：")
+            st.subheader("🧐 資料預覽 (請確認數量是否正確)")
             
             # 抓出前 5 筆預覽
             if processed_data:
@@ -373,6 +371,8 @@ def main():
                 if preview_list:
                     preview_df = pd.concat(preview_list)
                     st.dataframe(preview_df.head(10), use_container_width=True)
+            
+            st.info(f"偵測到 {audit_info['groups_found']} 組產品，共 {audit_info['total_rows']} 筆交易。")
 
             if st.button("🚀 確認無誤，開始預測", type="primary"):
                 result_df = run_prediction_engine(processed_data)
@@ -381,9 +381,9 @@ def main():
                     st.success(f"完成！共產出 {len(result_df)} 筆預測。")
                     st.dataframe(result_df, use_container_width=True)
                     excel_data = convert_df_to_excel(result_df)
-                    st.download_button("📥 下載完整報告", excel_data, "prediction_v7.xlsx")
+                    st.download_button("📥 下載完整報告", excel_data, "prediction_v8.xlsx")
                 else:
-                    st.warning("⚠️ 無法產出結果 (可能原因是歷史資料不足，每項產品需至少 2 筆交易)。")
+                    st.warning("⚠️ 無法產出結果 (歷史資料不足)。")
 
 if __name__ == "__main__":
     main()
